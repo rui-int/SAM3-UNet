@@ -22,7 +22,7 @@ args = parser.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 test_loader = TestDataset(args.test_image_path, args.test_gt_path, 336)
-model = SAM3UNet().to(device)
+model = SAM3UNet(img_size=336).to(device)
 model.load_state_dict(torch.load(args.checkpoint), strict=True)
 model.eval()
 model.cuda()
