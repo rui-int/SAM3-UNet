@@ -1,30 +1,42 @@
-import os
-import sam3
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sam3 import build_sam3_image_model
 from timm.models.layers import trunc_normal_   
+from sam3.model.vitdet import ViT
 
 
-class DoubleConv(nn.Module):
-    """(convolution => [BN] => ReLU) * 2"""
-
-    def __init__(self, in_channels, out_channels, mid_channels=None):
+class LightBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        if not mid_channels:
-            mid_channels = out_channels
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+        self.conv_in = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels//4, 1),
+            nn.BatchNorm2d(in_channels//4, 1),
+            nn.GELU()
+        )
+        self.conv_out = nn.Sequential(
+            nn.Conv2d(in_channels//2, out_channels, 1),
+            nn.BatchNorm2d(out_channels, 1),
+            nn.GELU()
+        )
+        self.dw1 = nn.Sequential(
+            nn.Conv2d(in_channels//8, in_channels//8, kernel_size=3, stride=1, padding=1, groups=in_channels//8),
+            nn.BatchNorm2d(in_channels//8),
+            nn.GELU()
+        )
+        self.dw2 = nn.Sequential(
+            nn.Conv2d(in_channels//8, in_channels//8, kernel_size=3, stride=1, padding=1, groups=in_channels//8),
+            nn.BatchNorm2d(in_channels//8),
+            nn.GELU()
         )
 
     def forward(self, x):
-        return self.double_conv(x)
+        x = self.conv_in(x)
+        x1, x2 = torch.split(x, x.shape[1]//2, 1)
+        x3 = self.dw1(x2)
+        x4 = self.dw2(x3)
+        x = torch.cat([x1, x2, x3, x4], dim=1)
+        x = self.conv_out(x)
+        return x
     
     
 class Up(nn.Module):
@@ -33,7 +45,8 @@ class Up(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        # self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        self.conv = LightBlock(in_channels, out_channels)
 
     def forward(self, x1, x2=None):
         if x2 is not None:
@@ -79,22 +92,57 @@ class Adapter(nn.Module):
         self.prompt_learn.apply(_init_weights)
 
 
+def _create_vit_backbone(img_size):
+    """Create ViT backbone for visual feature extraction."""
+    return ViT(
+      #   img_size=1008,
+        img_size=img_size,
+        pretrain_img_size=336,
+        patch_size=14,
+        embed_dim=1024,
+        depth=32,
+        num_heads=16,
+        mlp_ratio=4.625,
+        norm_layer="LayerNorm",
+        drop_path_rate=0.1,
+        qkv_bias=True,
+        use_abs_pos=True,
+        tile_abs_pos=True,
+        global_att_blocks=(7, 15, 23, 31),
+        rel_pos_blocks=(),
+        use_rope=True,
+        use_interp_rope=True,
+        window_size=24,
+        pretrain_use_cls_token=True,
+        retain_cls_token=False,
+        ln_pre=True,
+        ln_post=False,
+        return_interm_layers=False,
+        bias_patch_embed=False,
+        # compile_mode=compile_mode,
+        compile_mode=None,
+    )
+
+
 class SAM3UNet(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, checkpoint_path, img_size=336) -> None:
         super(SAM3UNet, self).__init__()
-        sam3_root = os.path.join(os.path.dirname(sam3.__file__), "..")
-        bpe_path = f"{sam3_root}/assets/bpe_simple_vocab_16e6.txt.gz"
-        self.sam3 = build_sam3_image_model(bpe_path=bpe_path, load_from_HF=False, device="cuda"
-                                    #    , checkpoint_path="YOUR SAM3.PT CHECKPOINT PATH"
-                                    ).backbone.vision_backbone.trunk
-        for param in self.sam3.parameters():
+        self.sam3_vit = _create_vit_backbone(img_size)
+        if checkpoint_path:
+            ckpt = torch.load(checkpoint_path)
+            new_ckpt = dict()
+            for k, v in ckpt.items():
+                if "detector.backbone.vision_backbone.trunk" in k and 'freqs_cis' not in k:
+                    new_ckpt[k[len("detector.backbone.vision_backbone.trunk."):]] = v
+            self.sam3_vit.load_state_dict(new_ckpt, strict=False)
+        for param in self.sam3_vit.parameters():
             param.requires_grad = False
         blocks = []
-        for block in self.sam3.blocks:
+        for block in self.sam3_vit.blocks:
             blocks.append(
                 Adapter(block)
-            )
-        self.sam3.blocks = nn.Sequential(
+            )  
+        self.sam3_vit.blocks = nn.Sequential(
             *blocks
         )
         self.reduce1 = nn.Conv2d(1024, 128, 1)
@@ -107,10 +155,9 @@ class SAM3UNet(nn.Module):
         self.up4 = Up(128, 128)
         self.head = nn.Conv2d(128, 1, 1)
         
-
     def forward(self, x):
         B, C, H, W = x.shape
-        x = self.sam3(x)[-1]
+        x = self.sam3_vit(x)[-1]
         x1 = F.interpolate(self.reduce1(x), size=(H//4, W//4), mode='bilinear')
         x2 = F.interpolate(self.reduce2(x), size=(H//8, W//8), mode='bilinear')
         x3 = F.interpolate(self.reduce3(x), size=(H//16, W//16), mode='bilinear')
@@ -120,14 +167,13 @@ class SAM3UNet(nn.Module):
         x = self.up2(x, x2)
         x = self.up1(x, x1)
         out = self.head(x)
-        out = F.interpolate(self.head(x), size=(H, W), mode='bilinear')
+        out = F.interpolate(out, size=(H, W), mode='bilinear')
         return out
 
     
 if __name__ == "__main__":
     model = SAM3UNet().cuda().eval()
     with torch.no_grad():
-        x = torch.randn(1, 3, 1008, 1008).cuda()
+        x = torch.randn(1, 3, 336, 336).cuda()
         out = model(x)
-
         print(out.shape)
