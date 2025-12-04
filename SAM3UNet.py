@@ -125,7 +125,7 @@ def _create_vit_backbone(img_size):
 
 
 class SAM3UNet(nn.Module):
-    def __init__(self, checkpoint_path, img_size=336) -> None:
+    def __init__(self, checkpoint_path=None, img_size=336) -> None:
         super(SAM3UNet, self).__init__()
         self.sam3_vit = _create_vit_backbone(img_size)
         if checkpoint_path:
@@ -177,3 +177,4 @@ if __name__ == "__main__":
         x = torch.randn(1, 3, 336, 336).cuda()
         out = model(x)
         print(out.shape)
+
